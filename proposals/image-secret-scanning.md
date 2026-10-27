@@ -2,7 +2,7 @@
 
 - **Status:** Draft – discussion
 - **Author:** Khuswant Rajpurohit ([@khuswant18](https://github.com/khuswant18))
-- **Date:** 2026-10-03
+- **Date:** 2026-10-03 (updated 2026-10-27 after review)
 - **Scope:** [`node-agent`](https://github.com/kubescape/node-agent), [`storage`](https://github.com/kubescape/storage), [`kubescape`](https://github.com/kubescape/kubescape) CLI, [`regolibrary`](https://github.com/kubescape/regolibrary), [`helm-charts`](https://github.com/kubescape/helm-charts); later [`kubevuln`](https://github.com/kubescape/kubevuln)
 - **Related:**
   - [kubescape/node-agent#987: Scan container images for misplaced secrets](https://github.com/kubescape/node-agent/issues/987) (open)
@@ -11,7 +11,15 @@
   - [kubescape/kubevuln#296: Dive and Trufflehog integration](https://github.com/kubescape/kubevuln/pull/296) (closed)
 - **Related work:** [SecurityException CRD design](https://github.com/kubescape/kubevuln/blob/c68de0013294ea8ac46738b906d38feb8820e7c1/docs/security-exception-design.md), [`evidence-of-finding`](./evidence-of-finding.md), [`storage-grpc-fastpath-auth`](./storage-grpc-fastpath-auth.md)
 
-Code links are pinned to the commits they were checked against (node-agent `44c4cb29`, storage `81ccbff2`, kubescape `6fd7b78d`, regolibrary `e67b7d42`, helm-charts `201914f3`, kubevuln `c68de001`). Things marked **tested** were tried on a real cluster; [Appendix A](#appendix-a-how-the-claims-were-tested) lists how.
+Code links are pinned to the commits they were checked against (node-agent `44c4cb29`, storage `81ccbff2`, k8s-interface `e9b55e6c`, kubescape `6fd7b78d`, regolibrary `e67b7d42`, helm-charts `201914f3`, kubevuln `c68de001`). Things marked **tested** were tried on a real cluster; [Appendix A](#appendix-a-how-the-claims-were-tested) lists how.
+
+### Changes after the first review (on `5861bce`)
+
+- Kubescape matches a workload to findings by the **image digest its Pods run**, not by image name and tag ([section 7](#7-showing-it-in-kubescape)).
+- A missing or `initializing` result is shown as **needs review**, never as passed. The full reporting contract is in [section 7](#reporting-contract).
+- A node with overlay layers can **take over** a `not-scanned` result. A node without them can never overwrite a scan ([section 2](#taking-over-a-not-scanned-result)).
+- The saved object is limited in **bytes**, not only in number of findings, and a failed write has a defined recovery ([section 6](#staying-under-the-size-limit)).
+- The kubevuln#296 comparison is now presented as our own technical comparison, not as the reason it was closed.
 
 ## Summary
 
@@ -66,6 +74,8 @@ This is common: a study of 337,171 images found secrets in **8.5%** of them ([Da
 | What it stored | Nothing; **logged part of each secret** | **Full secret values** in a new CRD | Findings only, **no values** |
 | Effect on SBOM | A secret-scan error failed the SBOM | Separate | Separate |
 
+kubevuln#296 was closed without a public reason, and the visible maintainer comment on it was positive. The rows above are our own technical comparison, not the documented reasons it was closed.
+
 Review comments on #206: "I'd set `SkipBinaryFiles` to `true` in the first release. We need to make the scanning more efficient before we turn this on" (@slashben), and "this will be implemented in node-agent" (@matthyx).
 
 From the community meeting on #987:
@@ -80,7 +90,7 @@ From the community meeting on #987:
 4. Show the result as a Kubescape control on the workloads that use the image.
 5. Keep false alarms low.
 6. Keep the detector reusable by kubevuln and the CLI later.
-7. Keep the cost bounded, and never show a half-finished scan as "clean".
+7. Keep the cost bounded, and never show a half-finished or missing scan as "clean".
 
 ## Non-goals
 
@@ -120,7 +130,7 @@ flowchart TD
     S1c[Step 1: Image layers + image config<br/>found once, shared]
     S2[Step 2: SbomManager + Syft<br/>existing, unchanged]
     S3a{Step 3: Overlay layers found?}
-    S3b[Step 3: Skip, save result not-scanned]
+    S3b[Step 3: Skip, save result not-scanned<br/>a capable node can take over]
     S3c[Step 3: SecretScanManager<br/>new]
     S3d[Step 3: Reserve, only one node<br/>scans each image]
     subgraph MOD[Step 4: secretscan module, new]
@@ -136,7 +146,7 @@ flowchart TD
   end
   subgraph KS[Kubescape]
     S6a[Step 6: SecurityException]
-    S6b[Step 6: kubescape scan reads findings]
+    S6b[Step 6: kubescape scan matches<br/>Pod image digests to findings]
     S6c[Step 6: New control C-03xx:<br/>workload failed]
   end
   S1 --> S1b --> S1c
@@ -160,8 +170,8 @@ node-agent gets an event for every new container. It finds the image's layers on
 The secret scan runs next to the SBOM, not inside it. They have separate status and error handling.
 
 **Step 3. Decide whether to scan, and make sure only one node does it (new).**
-- If the node does not use overlay layers, node-agent can only see the live container filesystem. That includes mounted Kubernetes Secrets, which are not part of the image. So we skip and save the scan result `not-scanned`.
-- Otherwise, the first node to see the image creates its result object with status `initializing`. Other nodes see that it already exists and skip. SBOMs already work this way.
+- If the node does not use overlay layers, node-agent can only see the live container filesystem. That includes mounted Kubernetes Secrets, which are not part of the image. So we skip and save the scan result `not-scanned`. Such a node only ever creates the object and never updates it, so it can't overwrite a real scan. If a node with overlay layers sees the image later, it takes over and scans it.
+- Otherwise, the first node to see the image creates its result object with status `initializing`. Other nodes see that it already exists and skip. SBOMs already work this way. The exceptions to this rule are in [Taking over a `not-scanned` result](#taking-over-a-not-scanned-result).
 
 **Step 4. Find the secrets (new).**
 - The **walker** reads every layer, from top to bottom. When a higher layer deletes or replaces a file, the walker marks the lower copy as **hidden**. Hidden files still count, because anyone who pulls the image can read them.
@@ -171,10 +181,10 @@ The secret scan runs next to the SBOM, not inside it. They have separate status 
 For the example image, this finds all four secrets: the key (visible), the AWS key (hidden, deleted), the password (hidden, overwritten), and the token (from the config).
 
 **Step 5. Save the result once per image (new).**
-One object per image, with the same name as the SBOM. Each finding has a rule, path, line, layer, visible or hidden, and a fingerprint. **The secret value is never saved.** The scan result is always set: `complete`, `incomplete` or `not-scanned`. When the image is no longer running, storage cleanup deletes the object, as it does for SBOMs.
+One object per image, with the same name as the SBOM. Each finding has a rule, path, line, layer, visible or hidden, and a fingerprint. **The secret value is never saved.** The scan result is always set: `complete`, `incomplete` or `not-scanned`. The object is kept under the storage size limit in bytes. If some findings don't fit, the summary still counts them and the result is marked `incomplete`. When the image is no longer running, storage cleanup deletes the object, as it does for SBOMs.
 
 **Step 6. Kubescape reports it (new).**
-`kubescape scan` reads the findings, applies any SecurityException, and a new control marks the workloads that use the image as failed.
+`kubescape scan` finds the image digests that each workload's Pods are running and reads the result for each digest. It applies any SecurityException, and a new control marks the workloads that run an image with findings as failed. A workload passes only when every digest it runs has a complete, clean result. A missing or unfinished result shows as **needs review**.
 
 ## What we reuse from node-agent today
 
@@ -200,8 +210,8 @@ What we **cannot** reuse: the SBOM's file view ([`NodeResolver.FilesByPath`](htt
 | Habit | How |
 |---|---|
 | Object name | Same as the SBOM (`ImageInfoToSlug`), so the two objects pair by name |
-| One node per image | Create with `status=initializing`; skip on `AlreadyExists` |
-| Rescan | When the annotation `kubescape.io/secret-rules-version` changes |
+| One node per image | Create with `status=initializing`; skip on `AlreadyExists`, except in the [takeover cases](#taking-over-a-not-scanned-result) |
+| Rescan | When the annotation `kubescape.io/secret-rules-version` changes, or when a capable node takes over a `not-scanned` or stale result |
 | Object status (`kubescape.io/status`) | `initializing` while the scan runs, `ready` when the result is written. We don't use `too-large`, because storage stops accepting updates to an object in that state ([comment](https://github.com/kubescape/node-agent/blob/44c4cb2951d5de2ce09231920d9b21c61329eaca/pkg/sbommanager/v1/sbom_manager.go#L450-L457)) |
 
 There are two separate fields:
@@ -221,6 +231,29 @@ For example, an image on a node without overlay layers has object status `ready`
 | No overlay layers on the node | `not-scanned`, reason `no-overlay` | node-agent falls back to the live filesystem ([L271–L276](https://github.com/kubescape/node-agent/blob/44c4cb2951d5de2ce09231920d9b21c61329eaca/pkg/sbommanager/v1/sbom_manager.go#L271-L276)), which includes mounted Kubernetes Secrets |
 | Number of layer folders ≠ number of layer IDs | `incomplete`, reason `layer-mismatch` | We can't say which layer a file came from |
 | Time or size budget used up | `incomplete`, reason `budget-exceeded`, with what we found so far | A half-done scan must never look clean |
+| Findings don't fit in the object | `incomplete`, reason `findings-truncated`, `truncated: true` | See [Staying under the size limit](#staying-under-the-size-limit) |
+
+#### Taking over a `not-scanned` result
+
+A cluster can mix nodes with and without overlay layers. Suppose a node without overlay layers sees an image first and saves `not-scanned` / `no-overlay`. A node that can read the layers must be able to replace that result. Otherwise the image stays unscanned for as long as it runs.
+
+What a node does depends on whether it has overlay layers and on the object that already exists:
+
+| Node | Existing object | What the node does |
+|---|---|---|
+| Without overlay | None | Create it with object status `ready`, scan result `not-scanned`, reason `no-overlay` |
+| Without overlay | Any | Nothing. It only creates objects and never updates them, so it can't overwrite a scan |
+| With overlay | None | Create it with `initializing`, scan, write the result |
+| With overlay | `ready`, `not-scanned`, reason `no-overlay` | **Take over:** set it to `initializing` with a conditional update, then scan |
+| With overlay | `initializing`, started less than `staleReservationAfter` ago | Nothing. Another node is scanning |
+| With overlay | `initializing`, started more than `staleReservationAfter` ago | **Take over.** The other node probably stopped or couldn't write its result |
+| With overlay | `ready`, `complete` or `incomplete` | Nothing, unless the rules version changed |
+
+How a takeover works:
+
+- A takeover is an update that includes the `resourceVersion` the node just read. If two nodes try at the same time, storage accepts one and returns `Conflict` to the other, which then skips. The storage PR has to confirm that this kind checks `resourceVersion` on update (Q11).
+- When a node sets an object to `initializing`, it also sets `kubescape.io/secret-scan-started` to the current time. This is how other nodes tell that a reservation is stale. `staleReservationAfter` defaults to 15 minutes, three times the scan timeout.
+- Only `no-overlay` can be taken over. That reason depends on the node, not on the image, and a node with overlay layers never produces it. A result like `budget-exceeded` or `layer-mismatch` would usually come out the same on the next node, so taking it over would only repeat the scan.
 
 Known limitation: on Docker-runtime clusters (Docker Desktop, cri-dockerd with Docker 29), node-agent gets containers without image information and builds no SBOM. The secret scan has the same limitation.
 
@@ -322,10 +355,13 @@ metadata:
   namespace: kubescape
   annotations:
     kubescape.io/image-id: docker.io/library/myapp@sha256:…   # needed by cleanup
+    kubescape.io/image-digest: sha256:…                        # digest part only, matched to Pods (section 7)
     kubescape.io/image-tag: docker.io/library/myapp:1.2
     kubescape.io/status: ready
     kubescape.io/secret-rules-version: "1"
+    kubescape.io/secret-scan-started: "2026-10-03T10:00:00Z"   # finds stale reservations (section 2)
     # copy of the summary, because a normal list only returns metadata (see section 7)
+    # counts cover all findings, including any left out by the size limit
     kubescape.io/secret-scan-status: complete
     kubescape.io/secrets-critical: "2"
     kubescape.io/secrets-high: "1"
@@ -333,10 +369,12 @@ metadata:
 spec:
   scan:
     status: complete          # complete | incomplete | not-scanned, always set
-    reason: ""                # e.g. no-overlay, budget-exceeded
+    reason: ""                # e.g. no-overlay, budget-exceeded, findings-truncated
     filesScanned: 4120
     filesSkipped: 313
-    truncated: false          # true if we hit the findings limit
+    findingsTotal: 2
+    findingsStored: 2
+    truncated: false          # true if findings were left out (count or byte limit)
   findings:
   - ruleID: private-key
     severity: Critical
@@ -358,9 +396,32 @@ spec:
 
 Storage details:
 
-- **Size:** new object types get 400 KB by default ([config](https://github.com/kubescape/storage/blob/81ccbff2841c84010f50aa02bacb765e6e17eac9/pkg/config/config.go#L208)). We cap findings at 1,000 (about 200 bytes each) and set `truncated: true` if there are more.
+- **Size:** limited in bytes, not only by number of findings. See [Staying under the size limit](#staying-under-the-size-limit).
 - **Cleanup:** same rule as SBOMs ([`deleteByImageId`](https://github.com/kubescape/storage/blob/81ccbff2841c84010f50aa02bacb765e6e17eac9/pkg/registry/file/cleanup.go#L407)). The `kubescape.io/image-id` annotation must always be set, or cleanup deletes the object.
 - **One finding per (rule, path, layer, line).** A secret repeated in three layers gives three findings.
+- **One object per image ID.** The name comes from [`ImageInfoToSlug`](https://github.com/kubescape/k8s-interface/blob/e9b55e6c1199cee6ab1dea756e1fdc29b04d8515/names/slugs.go#L180-L196), which adds the last 6 characters of the image ID to the tag, so two digests of `app:stable` get two separate objects. Kubescape matches on the `kubescape.io/image-digest` annotation, not on the name.
+
+#### Staying under the size limit
+
+New object types get `maxObjectSize` 400,000 bytes by default ([config](https://github.com/kubescape/storage/blob/81ccbff2841c84010f50aa02bacb765e6e17eac9/pkg/config/config.go#L208)). Storage rejects any request whose body is larger with HTTP 413 ([QueueHandler](https://github.com/kubescape/storage/blob/81ccbff2841c84010f50aa02bacb765e6e17eac9/pkg/queuemanager/manager.go#L143-L149)). Limiting the number of findings doesn't keep us under that: 1,000 findings with 1 KiB paths add up to more than 1 MB from the paths alone.
+
+So node-agent limits the object in bytes as well as by count:
+
+1. Count every finding first. The summary (annotations and `spec.scan`) always shows the full counts, even when some findings are not stored.
+2. Sort the findings by severity, highest first, then by path and layer, so the same image always keeps the same findings.
+3. Build the object without findings, encoded the same way the client sends it to storage. That gives the base size.
+4. Add findings in that order while the encoded size stays at or under `maxObjectBytes` and the number stays at or under `maxFindings`. `maxObjectBytes` defaults to 360,000, which keeps 40,000 of the 400,000 bytes free for request overhead. It must be set below the storage `maxObjectSize` for this kind.
+5. If any finding was left out, set `truncated: true` and `findingsStored` lower than `findingsTotal`. A `complete` scan result becomes `incomplete` with reason `findings-truncated`.
+
+The counts still include the findings that were left out, so the control still fails the workload.
+
+If the final write fails:
+
+| Failure | What node-agent does |
+|---|---|
+| 413 (our size estimate was wrong) | Write again without findings: summary only, `truncated: true`, `incomplete`, reason `write-too-large` |
+| Any other error (timeout, storage restarting) | Retry 3 times with backoff, then write the summary-only object with reason `write-failed` |
+| The summary-only write fails too | Give up. The object stays `initializing`, and Kubescape shows **needs review**. After `staleReservationAfter`, any node with overlay layers (this one included) [takes it over](#taking-over-a-not-scanned-result) and scans again the next time it sees the image |
 
 ### 7. Showing it in Kubescape
 
@@ -370,7 +431,7 @@ We tested how Kubescape can read objects from storage. What we found:
 
 1. **A normal list returns only names, labels and annotations, not the findings.** The full object comes back only with the special option `resourceVersion=fullSpec` ([storage code](https://github.com/kubescape/storage/blob/81ccbff2841c84010f50aa02bacb765e6e17eac9/pkg/registry/file/storage.go#L1683)). Tested: 0 CVEs in a normal list, 653 with `fullSpec`.
 2. **A Rego rule can already read storage objects, but only their annotations.** We wrote a test rule that joins a Deployment's image with an SBOM's `kubescape.io/image-tag` annotation. It failed `Deployment/nginx` with no Kubescape code change.
-3. **Rules see Deployments, not their Pods.** So the rule has to match on the image name and tag, not on the image digest from the Pod.
+3. **Rules see Deployments, not their Pods.** On its own, a rule can only match by image name and tag. That isn't safe (see [Matching by digest](#matching-a-workload-to-its-images-by-digest)), so Kubescape has to add the Pods' image digests.
 4. **In the cluster, it silently passes.** The in-cluster scanner skips the `kubescape` namespace ([`excludeNamespaces`](https://github.com/kubescape/helm-charts/blob/201914f32051a53bdcae2aa181b617b911844cb9/charts/kubescape-operator/values.yaml#L54)), and all storage objects live there. With that setting, the same test rule passed nginx without any error.
 5. **The in-cluster scanner can't read storage objects at all** (no RBAC permission).
 6. **The old image-data input `ImageVulnerabilities` is not used.** C-0083 and C-0085 depend on it and return "irrelevant" even when an image has critical CVEs.
@@ -381,12 +442,50 @@ So whichever option we pick, Kubescape needs a change. Two options:
 |---|---|---|
 | How | The CLI loads the objects with `fullSpec` and gives them to the rule | The rule reads the summary counts from the annotations |
 | Shows file paths | Yes | No, only counts |
-| Matches image by | Exact digest | Name and tag |
-| Kubescape change | Bigger: new input type, loading, digest lookup, RBAC, namespace fix | Small: namespace fix, RBAC |
+| Matches image by | Digest that the Pods run | Digest that the Pods run (same lookup) |
+| Kubescape change | Bigger: new input type, loading full objects, digest lookup, RBAC, namespace fix | Smaller: digest lookup, namespace fix, RBAC |
 
-**Proposal:** option B first, option A later when we want file paths in the report.
+**Proposal:** option B first, option A later when we want file paths in the report. Option B still matches by digest; it only means the rule reads annotations instead of the full object.
 
-The control: `C-03xx` (the latest is C-0318), "Secrets in container image", category `Secrets`. It fails a workload when one of its images has findings at or above a set severity (default: High), hidden ones included. Images whose scan result is `incomplete` or `not-scanned` are shown for review, not passed.
+#### Matching a workload to its images by digest
+
+Matching by name and tag is not safe. Two workloads can both use `app:stable` but run different images, during a rollout or because nodes pulled the tag at different times. If the rule uses the clean image's report, the workload running the leaky image passes. If it combines every report for the tag, the clean workload fails.
+
+So Kubescape matches by the digest each Pod actually runs:
+
+1. For each workload, Kubescape finds its running Pods through owner references (Pod → ReplicaSet → Deployment, Pod → Job → CronJob, Pod → StatefulSet, and so on). It reads `imageID` from `status.containerStatuses[]` and `status.initContainerStatuses[]`.
+2. It keeps only the digest part (`sha256:…`). The Pod may report `docker.io/library/app@sha256:abc…` or just `sha256:abc…` (images without a registry digest, see Q2), so only the digest part is compared.
+3. node-agent writes the same digest part to the `kubescape.io/image-digest` annotation.
+4. The rule gets each workload's list of digests and looks up the result for each one.
+
+This needs Pods and their owners in Kubescape's input, not only the Deployment. Q10 asks whether the lookup should happen in Go before the rules run, or in Rego. Either way the rule only reads annotations. It doesn't need the full object (option A).
+
+#### Reporting contract
+
+The result for **one digest** comes from the objects whose `kubescape.io/image-digest` matches it:
+
+| Objects for this digest | Result for this digest |
+|---|---|
+| None | needs review |
+| Object status `initializing` | needs review |
+| `ready`, any scan result, findings at or above the threshold | failed |
+| `ready`, scan `complete`, no findings at or above the threshold | clean |
+| `ready`, scan `incomplete` or `not-scanned`, no findings at or above the threshold | needs review |
+
+If more than one object has the same digest (the same image under two tags), they describe the same bytes. Take the first result that applies in this order: failed, then clean, then needs review. So one `complete` scan is enough to make the digest clean.
+
+The result for **a workload** comes from all the digests of its running Pods:
+
+| Situation | Workload result |
+|---|---|
+| Any digest is failed | **failed** |
+| Every container in every running Pod has a digest, and every digest is clean | **passed** |
+| Anything else: a Pod without an `imageID`, an `imageID` with no digest part, or any digest needing review | **needs review** |
+| The workload has no running Pods | not checked (nothing is running) |
+
+"Needs review" is never shown as passed. The CLI scanning YAML files has no Pods, so the control doesn't apply there.
+
+The control: `C-03xx` (the latest is C-0318), "Secrets in container image", category `Secrets`. The threshold is a severity, default High. Hidden findings count the same as visible ones.
 
 Results appear at the next configuration scan (daily by default) unless continuous scanning is on.
 
@@ -441,6 +540,8 @@ nodeAgent:
       maxBytesPerImage: 512Mi
       timeout: 5m
       maxFindings: 1000
+      maxObjectBytes: 360000      # must be below storage maxObjectSize for this kind
+      staleReservationAfter: 15m
       skipBaseLayers: false
       extraAllowPaths: []
 
@@ -464,6 +565,8 @@ RBAC changes:
 | `node_agent.secretscan.scan.duration` | status |
 | `node_agent.secretscan.files.skipped.total` | reason (binary, size, allowlist) |
 | `node_agent.secretscan.findings.total` | severity |
+| `node_agent.secretscan.takeover.total` | reason (no-overlay, stale) |
+| `node_agent.secretscan.write.total` | status (ok, truncated, too-large, failed) |
 
 ## Test plan
 
@@ -475,6 +578,13 @@ RBAC changes:
 | False-alarm check | A fixed set of public images must keep the same number of findings |
 | No-secret-values test | Fake secrets must not appear in storage, logs or metrics |
 | Component test (kind) | Deploy the example image; check the saved object and the control result |
+| Same tag, different digests | Two Deployments use `app:stable`; one runs digest A (with secrets), the other digest B (clean). A fails, B passes. A Deployment in the middle of a rollout, with Pods on both A and B, fails |
+| Missing or unfinished report | No object, an `initializing` object, or a Pod without an `imageID`: the workload needs review and does not pass. An image with only a `sha256:` image ID still matches |
+| Mixed nodes, both orders | Node without overlay first, then node with overlay: the result ends `complete`. Node with overlay first, then node without: the result stays `complete`. Two nodes with overlay take over at the same time: only one scans |
+| Stale reservation | An `initializing` object older than `staleReservationAfter` is taken over; a newer one is not |
+| Long paths | 1,000 findings with paths of about 1 KiB: the stored findings fit under `maxObjectBytes`, `truncated: true`, scan `incomplete`, storage accepts the write, and the annotation counts match `findingsTotal` |
+| Byte boundary | An object exactly at `maxObjectBytes` keeps every finding; one byte more leaves out the last finding |
+| Write failures | A 413 leads to a summary-only write. Storage errors are retried, then a summary-only write. If storage stays down, the object stays `initializing` and is taken over later |
 
 ## Rollout
 
@@ -484,10 +594,10 @@ The feature is off by default until the control and the false-alarm check are st
 |---|---|---|---|
 | 1 | designs-and-proposals | This proposal | — |
 | 2 | node-agent | `secretscan` module: walker, detector, config scan, rules, tests | — |
-| 3 | storage | New object type, cleanup | 1 |
-| 4 | node-agent | `SecretScanManager`, config, metrics, component test | 2, 3 |
+| 3 | storage | New object type, cleanup, conditional update on `resourceVersion` | 1 |
+| 4 | node-agent | `SecretScanManager`, takeover, byte limit, config, metrics, component test | 2, 3 |
 | 5 | helm-charts | Capability, config, RBAC, storage size | 3, 4 |
-| 6 | kubescape | Namespace fix, RBAC (option B) | 3 |
+| 6 | kubescape | Pod digest lookup, reporting contract, namespace fix, RBAC (option B) | 3 |
 | 7 | regolibrary | New control and rule | 6 |
 | 8 | node-agent | Sidecar support, base-layer skip, per-layer cache | 4 |
 | 9 | kubevuln, helm-charts, kubescape | `secrets` in SecurityException | 7 |
@@ -513,8 +623,8 @@ Later: check whether the container really reads the file (using `ContainerProfil
 
 | # | Question | Our proposal |
 |---|---|---|
-| **Q1** | How should Kubescape read the findings: option B (annotations, small change) or option A (full object, file paths)? Is `ImageVulnerabilities` still used anywhere? | B first, A later |
-| **Q2** | For images without a registry digest (built locally, `kind load`, air-gapped), the Pod shows `sha256:abc…` but node-agent saves `docker.io/library/app@sha256:abc…`. Storage cleanup compares the two as text, finds no match, and deletes the SBOM and CVE report while the Pod is still running. **Tested.** This is a bug today, separate from this proposal. Is it already known? Should our new object wait for the fix? | I'll open a separate issue for it. Our object uses the same cleanup, so it gets the fix too, and doesn't need to wait |
+| **Q1** | How should Kubescape read the findings: option B (annotations, small change) or option A (full object, file paths)? Is `ImageVulnerabilities` still used anywhere? | B first, A later. Both match by the digest the Pods run |
+| **Q2** | For images without a registry digest (built locally, `kind load`, air-gapped), the Pod shows `sha256:abc…` but node-agent saves `docker.io/library/app@sha256:abc…`. Storage cleanup compares the two as text, finds no match, and deletes the SBOM and CVE report while the Pod is still running. **Tested.** This is a bug today, separate from this proposal. Is it already known? Should our new object wait for the fix? | I'll open a separate issue for it. Our object uses the same cleanup, so it gets the fix too, and doesn't need to wait. Until then, these images show as needs review, not passed |
 | **Q3** | Is a new object type in Kubescape storage OK? What name? | Yes, `ImageSecretScan` |
 | **Q4** | Where should the shared detector live? | Start in `node-agent/pkg/secretscan`; move to its own repo when kubevuln uses it |
 | **Q5** | Can we use Trivy's rules as data (Apache-2.0)? | Yes, a chosen subset; `generic-api-key` off |
@@ -522,6 +632,8 @@ Later: check whether the container really reads the file (using `ContainerProfil
 | **Q7** | Scan all layers, or skip the base image by default? | All layers with the allowlist; skipping is an option |
 | **Q8** | Limits and default: separate worker, 5 min / 512 MiB / 1,000 findings per image, off by default? | Yes |
 | **Q9** | Which control ID should we use? | The next one after C-0318 |
+| **Q10** | Where should Kubescape match Pod digests to workloads: in Go before the rules run, or in Rego with Pods and their owners as rule input? | In Go, so every rule that needs image results can reuse it |
+| **Q11** | Does storage check `resourceVersion` on update for this kind, so that only one node can take over a result? | To confirm in the storage PR; add it if missing |
 
 ## Appendix A: how the claims were tested
 
