@@ -21,6 +21,14 @@ Code links are pinned to the commits they were checked against (node-agent `44c4
 - The saved object is limited in **bytes**, not only in number of findings, and a failed write has a defined recovery ([section 6](#staying-under-the-size-limit)).
 - The kubevuln#296 comparison is now presented as our own technical comparison, not as the reason it was closed.
 
+### Changes after the second review (on `15d3a27`)
+
+- Each reservation has an owner token. Every final write, fallback and retry is a PUT carrying the `resourceVersion` **and** `uid` of that reservation, and its response is checked. A scanner that lost its reservation to a takeover can no longer overwrite the new result ([section 2](#only-the-owner-of-the-reservation-can-write-the-result)).
+- Fencing was checked against the real storage code. A merge patch without `resourceVersion`, and a PUT without `uid` after the object was deleted and created again, both still overwrite. So patches are not used after the reservation, and the `uid` is required.
+- Added what was promised in review: a stable `findingKey`, counting unique (rule, path) pairs, and an `includeHiddenFindings` control input.
+- A rules-version rescan only happens when the stored rules version is older than the node's own, so an old node-agent can't replace a newer scan during an upgrade.
+- New tests: a delayed old writer after takeover, a rules-version rescan while an old scan is running, and a lost write reply.
+
 ## Summary
 
 - Container images often contain passwords, tokens and keys by mistake. Kubescape does not find them today.
@@ -181,7 +189,7 @@ The secret scan runs next to the SBOM, not inside it. They have separate status 
 For the example image, this finds all four secrets: the key (visible), the AWS key (hidden, deleted), the password (hidden, overwritten), and the token (from the config).
 
 **Step 5. Save the result once per image (new).**
-One object per image, with the same name as the SBOM. Each finding has a rule, path, line, layer, visible or hidden, and a fingerprint. **The secret value is never saved.** The scan result is always set: `complete`, `incomplete` or `not-scanned`. The object is kept under the storage size limit in bytes. If some findings don't fit, the summary still counts them and the result is marked `incomplete`. When the image is no longer running, storage cleanup deletes the object, as it does for SBOMs.
+One object per image, with the same name as the SBOM. Each finding has a rule, path, line, layer, visible or hidden, a `fingerprint` for the exact occurrence and a `findingKey` that stays the same after a rebuild. **The secret value is never saved.** The scan result is always set: `complete`, `incomplete` or `not-scanned`. The object is kept under the storage size limit in bytes. If some findings don't fit, the summary still counts them and the result is marked `incomplete`. When the image is no longer running, storage cleanup deletes the object, as it does for SBOMs.
 
 **Step 6. Kubescape reports it (new).**
 `kubescape scan` finds the image digests that each workload's Pods are running and reads the result for each digest. It applies any SecurityException, and a new control marks the workloads that run an image with findings as failed. A workload passes only when every digest it runs has a complete, clean result. A missing or unfinished result shows as **needs review**.
@@ -211,7 +219,7 @@ What we **cannot** reuse: the SBOM's file view ([`NodeResolver.FilesByPath`](htt
 |---|---|
 | Object name | Same as the SBOM (`ImageInfoToSlug`), so the two objects pair by name |
 | One node per image | Create with `status=initializing`; skip on `AlreadyExists`, except in the [takeover cases](#taking-over-a-not-scanned-result) |
-| Rescan | When the annotation `kubescape.io/secret-rules-version` changes, or when a capable node takes over a `not-scanned` or stale result |
+| Rescan | When the stored `kubescape.io/secret-rules-version` is older than the node's own, or when a capable node takes over a `not-scanned` or stale result. Only the current owner of the reservation can write the result ([details](#only-the-owner-of-the-reservation-can-write-the-result)) |
 | Object status (`kubescape.io/status`) | `initializing` while the scan runs, `ready` when the result is written. We don't use `too-large`, because storage stops accepting updates to an object in that state ([comment](https://github.com/kubescape/node-agent/blob/44c4cb2951d5de2ce09231920d9b21c61329eaca/pkg/sbommanager/v1/sbom_manager.go#L450-L457)) |
 
 There are two separate fields:
@@ -247,12 +255,57 @@ What a node does depends on whether it has overlay layers and on the object that
 | With overlay | `ready`, `not-scanned`, reason `no-overlay` | **Take over:** set it to `initializing` with a conditional update, then scan |
 | With overlay | `initializing`, started less than `staleReservationAfter` ago | Nothing. Another node is scanning |
 | With overlay | `initializing`, started more than `staleReservationAfter` ago | **Take over.** The other node probably stopped or couldn't write its result |
-| With overlay | `ready`, `complete` or `incomplete` | Nothing, unless the rules version changed |
+| With overlay | `ready`, `complete` or `incomplete`, rules version **older** than this node's | **Take over** and rescan |
+| With overlay | `ready`, `complete` or `incomplete`, same or newer rules version | Nothing |
+
+A node never rescans because the stored rules version is *newer* than its own. During a rolling upgrade of node-agent, an old node would otherwise replace a new scan with an older one.
 
 How a takeover works:
 
-- A takeover is an update that includes the `resourceVersion` the node just read. If two nodes try at the same time, storage accepts one and returns `Conflict` to the other, which then skips. The storage PR has to confirm that this kind checks `resourceVersion` on update (Q11).
-- When a node sets an object to `initializing`, it also sets `kubescape.io/secret-scan-started` to the current time. This is how other nodes tell that a reservation is stale. `staleReservationAfter` defaults to 15 minutes, three times the scan timeout.
+- A takeover is a PUT that carries the `resourceVersion` and `uid` the node just read. If two nodes try at the same time, storage accepts one and returns `Conflict` to the other, which then skips. Why it must be a PUT and not a patch is explained in [the next section](#only-the-owner-of-the-reservation-can-write-the-result).
+- When a node sets an object to `initializing`, by creating it or by taking it over, it also sets `kubescape.io/secret-scan-started` to the current time. This is how other nodes tell that a reservation is stale. `staleReservationAfter` defaults to 15 minutes, three times the scan timeout.
+
+#### Only the owner of the reservation can write the result
+
+A takeover hands the image to a new scanner, but the old scanner may still be running. For example: scanner A pauses for more than 15 minutes, scanner B takes over and finishes, and then A resumes. If A could still write, it would replace B's result with older or less complete evidence. A rules-version rescan raises the same problem.
+
+So every reservation has an owner, and only the owner can write:
+
+1. **Owner token.** Each time a node puts an object into `initializing` (create, takeover, or rules-version rescan), it sets `kubescape.io/secret-scan-owner` to a new random token. It keeps three things from the object storage returned: the token, the `resourceVersion` and the `uid`.
+2. **Fenced writes.** Every write after that is a full **update (HTTP PUT, the clientset's `Update`)** whose body carries the kept `resourceVersion` **and** `uid`. This covers the final result, the summary-only fallbacks, and every retry. A takeover changes the `resourceVersion`, so a write from the old owner gets `Conflict`.
+3. **Check the response.** A write counts as done only if the object storage returns has this node's token and the status it wrote. Anything else is handled like a `Conflict`.
+4. **After a `Conflict`, read the object again:**
+
+| What the node reads | What it means | What the node does |
+|---|---|---|
+| Owner is someone else's token | It lost the reservation | Drop the result. No retry, no fallback write. Counted as `write.total{status="fenced"}` |
+| Owner is its own token, status `ready` | Its earlier write worked, but the reply was lost | Done |
+| Owner is its own token, status `initializing` | Something else changed the object, but the node still owns it | Keep the new `resourceVersion` and retry the write |
+| Object is gone, or has a different `uid` | Cleanup deleted it (the image stopped running), and maybe another node created it again | Drop the result |
+
+Why it has to be exactly this. Each point below was checked with a test against storage `81ccbff2`: the real `genericregistry.Store` and file/SQLite backend, using `SBOMSyft` as a stand-in for the new kind. For the patch cases, the test copies the apiserver's merge-patch step.
+
+| Write | Result |
+|---|---|
+| PUT with an old `resourceVersion` | `Conflict`. Already covered upstream by `TestDifferential_UpdateResourceVersion` |
+| Merge patch with no `resourceVersion` (what node-agent's [`PatchSBOMAnnotations`](https://github.com/kubescape/node-agent/blob/44c4cb2951d5de2ce09231920d9b21c61329eaca/pkg/storage/v1/storage.go#L108-L118) sends) | **Applied.** Not fenced |
+| Merge patch with an old `resourceVersion` | `Conflict` |
+| PUT with an old `resourceVersion` but **no `uid`**, after the object was deleted and created again | **Applied.** `resourceVersion` is a counter per object that restarts at 1, so an old value can match the new object |
+| PUT with an old `resourceVersion` and the old `uid`, after delete and re-create | `Conflict` (the UID precondition fails) |
+| Merge patch with an old `resourceVersion` and the old `uid`, after delete and re-create | Rejected, but as `Invalid` ("uid is immutable"), not `Conflict` |
+| PUT with an old `resourceVersion` to an object whose status is `too-large` | Returns **success** but writes nothing. Storage skips every check for `too-large` objects ([storage.go](https://github.com/kubescape/storage/blob/81ccbff2841c84010f50aa02bacb765e6e17eac9/pkg/registry/file/storage.go#L1937-L1944), and the same in [singlewriter.go](https://github.com/kubescape/storage/blob/81ccbff2841c84010f50aa02bacb765e6e17eac9/pkg/registry/file/singlewriter.go#L1079)) |
+
+So the rules are:
+
+- Every write after the reservation is a PUT with `resourceVersion` and `uid`. **No merge or JSON patch, including for annotation-only changes.** The SBOM path uses a patch, but it doesn't have to stop old writers.
+- A takeover is also a PUT with `resourceVersion` and `uid`. It is based on the metadata-only read, which returns the real `resourceVersion` (checked). That PUT clears `spec`, so the findings from the earlier scan go away until the new scan writes. That's fine: an object in `initializing` shows as needs review either way.
+- A response that doesn't carry this node's token and status counts as not written. In practice only the `too-large` case causes this. Nothing in this design sets `too-large`, and storage sets it only for ContainerProfiles, but the check keeps it safe if that ever changes.
+- The only writes that aren't fenced are the two creates, the no-overlay `not-scanned` and the first `initializing`, and those fail with `AlreadyExists` instead of overwriting. Storage cleanup can delete the object at any time, which the table above handles.
+
+Old owners can never write after a takeover, so these cases are safe:
+
+- **Clock skew between nodes:** it can only make a takeover happen early. That repeats some work but can't lose or overwrite a newer result.
+- **A rules-version rescan while an old scan is still running:** the rescan is a takeover, so the old scan's write is fenced.
 - Only `no-overlay` can be taken over. That reason depends on the node, not on the image, and a node with overlay layers never produces it. A result like `budget-exceeded` or `layer-mismatch` would usually come out the same on the next node, so taking it over would only repeat the scan.
 
 Known limitation: on Docker-runtime clusters (Docker Desktop, cri-dockerd with Docker 29), node-agent gets containers without image information and builds no SBOM. The secret scan has the same limitation.
@@ -360,12 +413,16 @@ metadata:
     kubescape.io/status: ready
     kubescape.io/secret-rules-version: "1"
     kubescape.io/secret-scan-started: "2026-10-03T10:00:00Z"   # finds stale reservations (section 2)
+    kubescape.io/secret-scan-owner: 7d0f…                      # random token of the reservation owner (section 2)
     # copy of the summary, because a normal list only returns metadata (see section 7)
-    # counts cover all findings, including any left out by the size limit
+    # counts are unique (rule, path) pairs, and include any findings left out by the size limit
     kubescape.io/secret-scan-status: complete
     kubescape.io/secrets-critical: "2"
     kubescape.io/secrets-high: "1"
-    kubescape.io/secrets-hidden: "2"
+    kubescape.io/secrets-visible-critical: "1"   # pairs with at least one copy visible at runtime
+    kubescape.io/secrets-visible-high: "1"
+    kubescape.io/secrets-hidden: "2"             # pairs with no copy visible at runtime
+    # medium and low counts follow the same pattern
 spec:
   scan:
     status: complete          # complete | incomplete | not-scanned, always set
@@ -383,7 +440,8 @@ spec:
     line: 1
     layer: sha256:37a687…
     visibleAtRuntime: true
-    fingerprint: 3f9c…
+    fingerprint: 3f9c…        # this exact occurrence: rule + path + layer + line
+    findingKey: b71e…         # stable across rebuilds: rule + path
   - ruleID: aws-secret-access-key
     severity: Critical
     source: file
@@ -392,13 +450,18 @@ spec:
     layer: sha256:c3a091…
     visibleAtRuntime: false   # deleted in a later layer
     fingerprint: 8a21…
+    findingKey: 0c4d…
 ```
 
 Storage details:
 
 - **Size:** limited in bytes, not only by number of findings. See [Staying under the size limit](#staying-under-the-size-limit).
 - **Cleanup:** same rule as SBOMs ([`deleteByImageId`](https://github.com/kubescape/storage/blob/81ccbff2841c84010f50aa02bacb765e6e17eac9/pkg/registry/file/cleanup.go#L407)). The `kubescape.io/image-id` annotation must always be set, or cleanup deletes the object.
-- **One finding per (rule, path, layer, line).** A secret repeated in three layers gives three findings.
+- **One finding per (rule, path, layer, line).** A secret repeated in three layers gives three findings. Each layer is a separate copy that someone can extract, and the fix depends on which layer it's in.
+- **Two IDs per finding, neither made from the secret:**
+  - `fingerprint = SHA-256(ruleID + path + layer + line)` identifies one exact occurrence in one image. It changes when the layer or the line changes.
+  - `findingKey = SHA-256(ruleID + path)` stays the same when the image is rebuilt. It is used for counting and for exceptions.
+- **Counting unique (rule, path) pairs.** The summary counts and the control count each `findingKey` once, not once per layer or line, so a secret copied into three layers is one secret. A pair counts as **visible** if at least one of its copies is visible at runtime, otherwise as **hidden**. Findings from the image config count as visible. Trade-off: two different secrets of the same type in the same file count as one. `findingsTotal` and `findingsStored` count list entries (occurrences), not pairs.
 - **One object per image ID.** The name comes from [`ImageInfoToSlug`](https://github.com/kubescape/k8s-interface/blob/e9b55e6c1199cee6ab1dea756e1fdc29b04d8515/names/slugs.go#L180-L196), which adds the last 6 characters of the image ID to the tag, so two digests of `app:stable` get two separate objects. Kubescape matches on the `kubescape.io/image-digest` annotation, not on the name.
 
 #### Staying under the size limit
@@ -419,9 +482,10 @@ If the final write fails:
 
 | Failure | What node-agent does |
 |---|---|
-| 413 (our size estimate was wrong) | Write again without findings: summary only, `truncated: true`, `incomplete`, reason `write-too-large` |
-| Any other error (timeout, storage restarting) | Retry 3 times with backoff, then write the summary-only object with reason `write-failed` |
-| The summary-only write fails too | Give up. The object stays `initializing`, and Kubescape shows **needs review**. After `staleReservationAfter`, any node with overlay layers (this one included) [takes it over](#taking-over-a-not-scanned-result) and scans again the next time it sees the image |
+| `Conflict` | Read the object again and follow the [owner rules](#only-the-owner-of-the-reservation-can-write-the-result). If another node owns it now, stop without writing |
+| 413 (our size estimate was wrong) | Write again without findings: summary only, `truncated: true`, `incomplete`, reason `write-too-large`. Still a fenced write |
+| Any other error (timeout, storage restarting) | Retry 3 times with backoff, then write the summary-only object with reason `write-failed`. Every retry and the fallback are fenced writes |
+| The summary-only write fails too (not because of `Conflict`) | Give up. The object stays `initializing`, and Kubescape shows **needs review**. After `staleReservationAfter`, any node with overlay layers (this one included) [takes it over](#taking-over-a-not-scanned-result) and scans again the next time it sees the image |
 
 ### 7. Showing it in Kubescape
 
@@ -485,7 +549,12 @@ The result for **a workload** comes from all the digests of its running Pods:
 
 "Needs review" is never shown as passed. The CLI scanning YAML files has no Pods, so the control doesn't apply there.
 
-The control: `C-03xx` (the latest is C-0318), "Secrets in container image", category `Secrets`. The threshold is a severity, default High. Hidden findings count the same as visible ones.
+The control: `C-03xx` (the latest is C-0318), "Secrets in container image", category `Secrets`. "Findings at or above the threshold" means unique (rule, path) pairs, counted as in [section 6](#6-the-saved-result). It has two inputs:
+
+| Input | Default | Meaning |
+|---|---|---|
+| `minSeverity` | `High` | Lowest severity that fails the control |
+| `includeHiddenFindings` | `true` | When `true`, hidden pairs count the same as visible ones: anyone who can pull the image can read them. When `false`, only pairs with a copy visible at runtime count, using the `kubescape.io/secrets-visible-*` annotations |
 
 Results appear at the next configuration scan (daily by default) unless continuous scanning is on.
 
@@ -506,7 +575,10 @@ spec:
   secrets:
   - ruleID: private-key
     path: /etc/ssl/private/ssl-cert-snakeoil.key
+    # layer: sha256:…   optional, to accept only one copy
 ```
+
+An entry matches on `ruleID` + `path`, which is the `findingKey`, so it keeps working after the image is rebuilt and the layer digests change. `layer` is optional and narrows it to one copy.
 
 This needs:
 - a new `secrets` field. **Tested:** today the cluster rejects it with `unknown field "spec.secrets"`.
@@ -522,7 +594,7 @@ Exceptions only work when `capabilities.riskAcceptance` is enabled (off by defau
 | Storage | No value, no masked value, no surrounding lines |
 | Logs | Never log what matched. Errors include only the rule ID and path |
 | Metrics | Labels are only status, reason and severity. No paths, no image names |
-| Fingerprint | `SHA-256(rule + path + layer + line)`. No secret goes in, so it can't be reversed |
+| Fingerprint and `findingKey` | `SHA-256(rule + path + layer + line)` and `SHA-256(rule + path)`. No secret goes in, so neither can be reversed to a value |
 
 A test puts known fake secrets in an image, scans it, then searches storage, logs and metrics for them. If any appear, the test fails.
 
@@ -554,7 +626,7 @@ RBAC changes:
 
 | Who | Needs |
 |---|---|
-| node-agent | create, get, update, patch on the new object |
+| node-agent | create, get, update on the new object (no `patch`; see section 2) |
 | kubescape | get, list on the new object |
 
 ## Metrics
@@ -566,7 +638,7 @@ RBAC changes:
 | `node_agent.secretscan.files.skipped.total` | reason (binary, size, allowlist) |
 | `node_agent.secretscan.findings.total` | severity |
 | `node_agent.secretscan.takeover.total` | reason (no-overlay, stale) |
-| `node_agent.secretscan.write.total` | status (ok, truncated, too-large, failed) |
+| `node_agent.secretscan.write.total` | status (ok, truncated, too-large, failed, fenced) |
 
 ## Test plan
 
@@ -582,6 +654,15 @@ RBAC changes:
 | Missing or unfinished report | No object, an `initializing` object, or a Pod without an `imageID`: the workload needs review and does not pass. An image with only a `sha256:` image ID still matches |
 | Mixed nodes, both orders | Node without overlay first, then node with overlay: the result ends `complete`. Node with overlay first, then node without: the result stays `complete`. Two nodes with overlay take over at the same time: only one scans |
 | Stale reservation | An `initializing` object older than `staleReservationAfter` is taken over; a newer one is not |
+| Delayed old writer | Scanner A reserves and pauses, B takes over and writes `complete`, then A resumes. A's final write and its summary-only fallback both get `Conflict`, A sees another owner and stops, and B's result is unchanged |
+| Rules-version rescan with an old scan running | A scans with rules v1; B rescans with v2 and finishes; A's write is fenced. A node with rules v1 that sees a v2 result does not rescan |
+| Old writer after delete and re-create | A reserves (`resourceVersion` 1), cleanup deletes the object, C creates it again (`resourceVersion` 1 again). A's write gets `Conflict` because of the `uid`, A sees another `uid` and stops, and C's reservation is unchanged |
+| Storage fencing (storage PR, through the generated clientset node-agent uses) | `Update` with an old `resourceVersion` gives `Conflict`. `Update` with the old `uid` after delete and re-create gives `Conflict`. The metadata-only `Get` returns the same `resourceVersion` as a full `Get`. A merge patch without `resourceVersion` is applied (this documents why node-agent must not use patches) |
+| Counting and IDs | The same secret in three layers gives three findings, one `findingKey` and a count of 1. A pair with one visible and one hidden copy counts as visible. `findingKey` stays the same when the image is rebuilt with a changed layer; `fingerprint` changes |
+| `includeHiddenFindings` | An image with only hidden High findings fails with `true` and passes with `false` (if nothing else needs review) |
+| No patches after the reservation | node-agent unit test: the fake storage client fails the test on any `Patch` call to this kind |
+| Response check | The fake storage returns success with another owner's token (like the `too-large` case). node-agent treats it as not written and does not report success |
+| Lost reply | The final write succeeds but the reply is lost; the retry gets `Conflict`, the node reads its own token with status `ready`, and stops without writing again |
 | Long paths | 1,000 findings with paths of about 1 KiB: the stored findings fit under `maxObjectBytes`, `truncated: true`, scan `incomplete`, storage accepts the write, and the annotation counts match `findingsTotal` |
 | Byte boundary | An object exactly at `maxObjectBytes` keeps every finding; one byte more leaves out the last finding |
 | Write failures | A 413 leads to a summary-only write. Storage errors are retried, then a summary-only write. If storage stays down, the object stays `initializing` and is taken over later |
@@ -594,7 +675,7 @@ The feature is off by default until the control and the false-alarm check are st
 |---|---|---|---|
 | 1 | designs-and-proposals | This proposal | — |
 | 2 | node-agent | `secretscan` module: walker, detector, config scan, rules, tests | — |
-| 3 | storage | New object type, cleanup, conditional update on `resourceVersion` | 1 |
+| 3 | storage | New object type, cleanup, fencing tests (PUT with `resourceVersion` + `uid`) | 1 |
 | 4 | node-agent | `SecretScanManager`, takeover, byte limit, config, metrics, component test | 2, 3 |
 | 5 | helm-charts | Capability, config, RBAC, storage size | 3, 4 |
 | 6 | kubescape | Pod digest lookup, reporting contract, namespace fix, RBAC (option B) | 3 |
@@ -633,7 +714,7 @@ Later: check whether the container really reads the file (using `ContainerProfil
 | **Q8** | Limits and default: separate worker, 5 min / 512 MiB / 1,000 findings per image, off by default? | Yes |
 | **Q9** | Which control ID should we use? | The next one after C-0318 |
 | **Q10** | Where should Kubescape match Pod digests to workloads: in Go before the rules run, or in Rego with Pods and their owners as rule input? | In Go, so every rule that needs image results can reuse it |
-| **Q11** | Does storage check `resourceVersion` on update for this kind, so that only one node can take over a result? | To confirm in the storage PR; add it if missing |
+| **Q11** | Does storage reject an old writer, so that only one node can take over a result? | For PUT with `resourceVersion` + `uid`, yes. Checked at storage `81ccbff2` with the real backend (section 2). A merge patch without `resourceVersion`, or a PUT without `uid` after delete and re-create, is **not** rejected, so node-agent uses neither. The storage PR keeps a test for this through the clientset |
 
 ## Appendix A: how the claims were tested
 
